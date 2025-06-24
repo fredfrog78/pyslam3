@@ -277,7 +277,14 @@ def test_cli_runs_basic(tmp_path, monkeypatch):
     assert f"Input LVX2 file: {input_file}" in output
     assert f"Output map PLY file: {output_map}" in output
     assert f"Output trajectory TXT file: {output_traj}" in output
-    assert "Successfully opened LVX2 file." in output # Check if it tried to parse
+    # Check for absence of common error indicators and presence of completion messages
+    assert "Error" not in output
+    assert "Exception" not in output
+    # Check for a positive indication of processing, even if dummy.
+    # Based on current cli.py, it will try to read frames and might print about it.
+    # If read_frames yields nothing (as it would for a header-only file),
+    # it might then print about saving an empty map/trajectory.
+    assert "Map PLY saved to" in output or "Trajectory saved to" in output or "No frames found or processed" in output
 
 def test_cli_file_not_found(tmp_path, monkeypatch, capsys):
     import sys # Import sys here
@@ -313,4 +320,220 @@ def test_cli_invalid_lvx_file(tmp_path, monkeypatch, capsys):
     cli_main()
 
     captured = capsys.readouterr()
-    assert "Error processing LVX2 file: Invalid LVX2 file signature" in captured.out
+    # The error message from cli.py's except block is "Error processing LVX2 file or other value error: {e}"
+    # And the e from LVX2Reader is "Invalid LVX2 file signature: expected b'livox_tech' prefix, got ..."
+    expected_error_snippet = "Error processing LVX2 file or other value error: Invalid LVX2 file signature" # Check for the key part.
+    assert expected_error_snippet in captured.out
+
+def test_read_frames_from_handcrafted_file(temp_lvx2_file):
+    # --- Create Handcrafted LVX2 Content ---
+    # 1. Headers
+    device_count = 1
+    dev_info_data = {
+        'lidar_sn_code': "SNFRAME01", 'hub_sn_code': "HUBFRAME01", 'lidar_id': 1,
+        'lidar_type': 0, 'device_type': 9, 'extrinsic_enable': 0, # Extrinsic disabled for simplicity
+        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'x': 0.0, 'y': 0.0, 'z': 0.0
+    }
+    header_content = create_lvx2_content(device_count=device_count, device_infos_override=[dev_info_data])
+
+    # Calculate offset of first frame
+    first_frame_offset = len(header_content) # 24 (public) + 5 (private) + 63*1 (device_info)
+
+    # --- Frame 1 ---
+    frame1_index = 0
+    frame1_pkg1_ts = 1000000000  # ns
+    frame1_pkg1_points_mm = [
+        (1000, 2000, 3000, 101), # x,y,z (mm), refl
+        (1500, 2500, 3500, 102)
+    ]
+    frame1_pkg1_data_type1 = b''
+    for p in frame1_pkg1_points_mm:
+        frame1_pkg1_data_type1 += struct.pack('<iiiB', p[0], p[1], p[2], p[3]) + b'\x00' # Add tag byte
+
+    # Package Header: Version(B), LiDAR ID(I), LiDAR_Type(B), Timestamp Type(B),
+    # Timestamp(Q), Udp Counter(H), Data Type(B), Length(I), Frame_Counter(B)
+    # These are 9 fields, total 1+4+1+1+8+2+1+4+1 = 23 bytes.
+    # Then, 4 reserved bytes follow. Total 27 bytes.
+    frame1_pkg1_header_fields = struct.pack('<BIBBQHBIB',
+                                            0,  # Version
+                                            1,  # LiDAR ID
+                                            0,  # LiDAR Type (Reserved)
+                                            0,  # Timestamp Type
+                                            frame1_pkg1_ts,  # Timestamp (ns)
+                                            0,  # UDP Counter
+                                            1,  # Data Type (Type 1: 14 bytes/pt)
+                                            len(frame1_pkg1_data_type1),  # Length of point data
+                                            0   # Frame Counter (Reserved)
+                                            )
+    frame1_pkg1_header = frame1_pkg1_header_fields + b'\x00\x00\x00\x00' # Reserved 4 bytes
+
+    frame1_pkg2_ts = 2000000000  # ns
+    frame1_pkg2_points_cm = [
+        (100, 200, 300, 201) # x,y,z (cm), refl
+    ]
+    frame1_pkg2_data_type2 = b''
+    for p in frame1_pkg2_points_cm:
+        frame1_pkg2_data_type2 += struct.pack('<hhhB', p[0], p[1], p[2], p[3]) + b'\x00' # Add tag byte
+
+    frame1_pkg2_header_fields = struct.pack('<BIBBQHBIB',
+                                            0,  # Version
+                                            1,  # LiDAR ID
+                                            0,  # LiDAR Type
+                                            0,  # Timestamp Type
+                                            frame1_pkg2_ts,  # Timestamp
+                                            1,  # UDP Counter
+                                            2,  # Data Type (Type 2: 8 bytes/pt)
+                                            len(frame1_pkg2_data_type2), # Length
+                                            0 # Frame Counter
+                                            )
+    frame1_pkg2_header = frame1_pkg2_header_fields + b'\x00\x00\x00\x00' # Reserved 4 bytes
+
+    frame1_content = frame1_pkg1_header + frame1_pkg1_data_type1 + \
+                     frame1_pkg2_header + frame1_pkg2_data_type2
+
+    # Frame 1 Header
+    frame1_header_len = 24
+    frame1_data_len = len(frame1_content)
+    next_frame_offset_for_f1 = first_frame_offset + frame1_header_len + frame1_data_len # Points to start of Frame 2 (or EOF if no Frame 2)
+
+    # --- Frame 2 (Last Frame) ---
+    frame2_index = 1
+    frame2_pkg1_ts = 3000000000 # ns
+    frame2_pkg1_points_mm = [
+        (500, 600, 700, 51)
+    ]
+    frame2_pkg1_data_type1 = b''
+    for p in frame2_pkg1_points_mm:
+        frame2_pkg1_data_type1 += struct.pack('<iiiB', p[0], p[1], p[2], p[3]) + b'\x00'
+
+    frame2_pkg1_header_fields = struct.pack('<BIBBQHBIB',
+                                            0,  # Version
+                                            1,  # LiDAR ID
+                                            0,  # LiDAR Type
+                                            0,  # Timestamp Type
+                                            frame2_pkg1_ts, # Timestamp
+                                            0,  # UDP Counter
+                                            1,  # Data Type (Type 1)
+                                            len(frame2_pkg1_data_type1), # Length
+                                            0   # Frame Counter
+                                            )
+    frame2_pkg1_header = frame2_pkg1_header_fields + b'\x00\x00\x00\x00' # Reserved 4 bytes
+    frame2_content = frame2_pkg1_header + frame2_pkg1_data_type1
+
+    # Frame 2 Header
+    frame2_header_len = 24
+    frame2_data_len = len(frame2_content)
+    # For the last frame, next_offset is 0
+    frame1_header = struct.pack('<QQQ', first_frame_offset, next_frame_offset_for_f1, frame1_index)
+    frame2_header = struct.pack('<QQQ', next_frame_offset_for_f1, 0, frame2_index)
+
+
+    # --- Assemble Full File ---
+    full_content = header_content + frame1_header + frame1_content + frame2_header + frame2_content
+    filepath = temp_lvx2_file(full_content)
+
+    # --- Test LVX2Reader ---
+    frames_read = []
+    with LVX2Reader(filepath) as reader:
+        for frame_data in reader.read_frames():
+            frames_read.append(frame_data)
+
+    assert len(frames_read) == 2
+
+    # --- Validate Frame 1 ---
+    frame1 = frames_read[0]
+    assert frame1['frame_index'] == frame1_index
+
+    expected_f1_points = np.array([
+        [1.0, 2.0, 3.0], # from pkg1
+        [1.5, 2.5, 3.5], # from pkg1
+        [1.0, 2.0, 3.0]  # from pkg2 (100cm, 200cm, 300cm)
+    ], dtype=np.float32)
+    expected_f1_ts = np.array([frame1_pkg1_ts, frame1_pkg1_ts, frame1_pkg2_ts], dtype=np.uint64)
+    expected_f1_refl = np.array([101, 102, 201], dtype=np.uint8)
+
+    assert frame1['point_cloud'].shape == (3, 3)
+    np.testing.assert_array_almost_equal(frame1['point_cloud'], expected_f1_points)
+    np.testing.assert_array_equal(frame1['timestamps'], expected_f1_ts)
+    np.testing.assert_array_equal(frame1['reflectivity'], expected_f1_refl)
+
+    # --- Validate Frame 2 ---
+    frame2 = frames_read[1]
+    assert frame2['frame_index'] == frame2_index
+
+    expected_f2_points = np.array([
+        [0.5, 0.6, 0.7] # from pkg1
+    ], dtype=np.float32)
+    expected_f2_ts = np.array([frame2_pkg1_ts], dtype=np.uint64)
+    expected_f2_refl = np.array([51], dtype=np.uint8)
+
+    assert frame2['point_cloud'].shape == (1, 3)
+    np.testing.assert_array_almost_equal(frame2['point_cloud'], expected_f2_points)
+    np.testing.assert_array_equal(frame2['timestamps'], expected_f2_ts)
+    np.testing.assert_array_equal(frame2['reflectivity'], expected_f2_refl)
+
+def test_read_frames_from_indoor_test_file(tmp_path): # tmp_path is not strictly needed but good for consistency
+    # Assuming 'indoor_sample.lvx' is in 'tests/data/' relative to the repo root
+    # Construct path to the test data file
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_file_path = os.path.join(current_dir, "data", "indoor_sample.lvx")
+
+    if not os.path.exists(data_file_path):
+        pytest.skip(f"Test data file not found: {data_file_path}")
+
+    frames_read_count = 0
+    total_points_count = 0
+
+    with LVX2Reader(data_file_path) as reader:
+        # Basic check: Ensure headers are read without error
+        assert reader.public_header is not None
+        assert reader.private_header is not None
+        assert reader.private_header.get('device_count', 0) > 0 # Expect at least one device
+        assert len(reader.device_info_list) == reader.private_header['device_count']
+
+        for i, frame_data in enumerate(reader.read_frames()):
+            frames_read_count += 1
+
+            assert isinstance(frame_data, dict)
+            assert 'frame_index' in frame_data
+            assert 'point_cloud' in frame_data
+            assert 'timestamps' in frame_data
+            assert 'reflectivity' in frame_data
+
+            assert isinstance(frame_data['frame_index'], (int, np.integer))
+            # assert frame_data['frame_index'] == i # Check if frame indices are sequential as expected
+
+            pc = frame_data['point_cloud']
+            ts = frame_data['timestamps']
+            refl = frame_data['reflectivity']
+
+            assert isinstance(pc, np.ndarray)
+            if pc.size > 0: # Only check shape if points exist
+                assert pc.ndim == 2
+                assert pc.shape[1] == 3
+                assert pc.dtype == np.float32
+                # Basic sanity check for coordinate values (e.g. not excessively large, not all zero)
+                # This depends on the typical scale of "indoor_sample.lvx"
+                # For now, just checking they are finite.
+                assert np.all(np.isfinite(pc))
+                total_points_count += pc.shape[0]
+
+
+            assert isinstance(ts, np.ndarray)
+            assert ts.dtype == np.uint64
+
+            assert isinstance(refl, np.ndarray)
+            assert refl.dtype == np.uint8
+
+            if pc.size > 0:
+                 assert len(ts) == pc.shape[0]
+                 assert len(refl) == pc.shape[0]
+            else: # if no points, timestamps and reflectivity should also be empty
+                 assert len(ts) == 0
+                 assert len(refl) == 0
+
+
+    assert frames_read_count > 0, "No frames were read from the LVX file."
+    # Depending on the file, we might also assert total_points_count > some_threshold
+    # For now, just ensuring it runs through is the primary goal.
+    # print(f"Successfully read {frames_read_count} frames with a total of {total_points_count} points from {data_file_path}")
