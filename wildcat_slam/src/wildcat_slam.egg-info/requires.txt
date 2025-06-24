@@ -1,0 +1,7 @@
+numpy
+scipy
+
+[dev]
+pytest
+flake8
+black

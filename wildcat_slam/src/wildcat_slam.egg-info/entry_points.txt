@@ -1,0 +1,2 @@
+[console_scripts]
+wildcat_slam = wildcat_slam.cli:main
