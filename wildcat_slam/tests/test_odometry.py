@@ -157,36 +157,169 @@ def test_initial_pose_interpolation_input_validation():
         initial_pose_interpolation(np.array([0.0,1.0,2.0]), np.array([np.eye(4),np.eye(4)]), np.array([0.5]))
 
 
-# --- match_surfels Tests (Placeholder) ---
+# --- match_surfels Tests ---
 
-def test_match_surfels_placeholder():
-    # Create dummy surfel structured arrays
+def test_match_surfels_logic():
     surfel_dtype = [
-        ('mean', '3f8'), ('normal', '3f8'), ('score', 'f8'),
+        ('mean', '3f8'), ('normal', '3f8'),
         ('timestamp_mean', 'f8'), ('resolution', 'f8')
+        # Not including 'score' or 'id' as match_surfels doesn't use them
     ]
-    surfels1 = np.array([
-        ([0,0,0], [0,0,1], 0.9, 0.1, 0.5),
-        ([1,0,0], [0,0,1], 0.8, 0.2, 0.5)
+
+    # --- Test Data Setup ---
+    # Surfel A0: Base for matching
+    # Surfel A1: Another distinct surfel in set A
+    # Surfel A2: Outlier in set A, not expected to match anything
+    # Surfel A3: Will have a time-violating partner in B
+    # Surfel A4: Will have a dist-violating partner in B
+
+    surfels_A_list = [
+        # A0: mean, normal, ts, res
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.1, 0.5),  # A0
+        ([5.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.2, 0.5),  # A1
+        ([10.0, 10.0, 10.0], [1.0, 0.0, 0.0], 0.3, 0.8), # A2 (outlier descriptor)
+        ([0.0, 5.0, 0.0], [0.0, 1.0, 0.0], 0.4, 0.5),  # A3 (for time test)
+        ([5.0, 5.0, 0.0], [0.0, 0.0, 1.0], 0.5, 0.5),  # A4 (for dist test)
+    ]
+    surfels_A = np.array(surfels_A_list, dtype=surfel_dtype)
+
+    # Surfel B0: Exact match for A0 (descriptor and time gap ok)
+    # Surfel B1: Close descriptor to A1, should match if A1 is its NN too.
+    # Surfel B2: Outlier, far from all A's
+    # Surfel B3: Exact descriptor match for A3, but timestamp too close
+    # Surfel B4: Exact descriptor match for A4, but artificially make its stored descriptor far for dist_thresh test (or test query result)
+    # Surfel B5: One-way NN to A0, but A0's NN is B0 (to test mutual NN)
+
+    surfels_B_list = [
+        # B0: matches A0
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.1, 0.5),
+        # B1: matches A1 (make it slightly different for realism, but still NN)
+        ([5.1, 0.1, 0.0], [0.0, 0.0, 1.0], 1.2, 0.5),
+        # B2: outlier descriptor
+        ([-10.0, -10.0, -10.0], [0.0, 1.0, 0.0], 1.3, 0.7),
+        # B3: time violation with A3 (ts_A3=0.4, ts_B3=0.45, gap=0.05)
+        ([0.0, 5.0, 0.0], [0.0, 1.0, 0.0], 0.45, 0.5),
+        # B4: dist violation with A4 (descriptor for A4 is [5,5,0, 0,0,1, 0.5])
+        #     Let B4 be identical geom+ts but we'll test dist_A_to_B[A4_idx]
+        #     This is implicitly tested by dist_thresh. If B4 is identical to A4, dist=0.
+        #     To test dist_thresh, we need a pair that *would* be mutual NN,
+        #     but their descriptor distance (from tree.query) is > dist_thresh.
+        #     Let's make B4 slightly further from A4 in descriptor space.
+        ([5.0, 5.0, 0.0], [0.1, 0.0, 0.9], 1.5, 0.5), # Normal slightly different -> diff descriptor
+        # B5: Not a mutual NN with any A. Say A0 is NN of B5, but B0 is NN of A0.
+        ([0.01, 0.01, 0.01], [0.0, 0.0, 1.0], 1.6, 0.5)
+    ]
+    surfels_B = np.array(surfels_B_list, dtype=surfel_dtype)
+
+    descriptor_dist_thresh = 0.5 # Max L2 distance in 7D descriptor space
+    time_gap_thresh = 0.1       # Min time diff: abs(ts_A - ts_B) >= time_gap_thresh
+
+    # Expected matches:
+    # (A0, B0): Descriptors are identical (dist=0). Time gap |0.1-1.1|=1.0 >= 0.1. OK.
+    # (A1, B1): Descriptors are close. A1=[5,0,0,0,0,1,0.5], B1=[5.1,0.1,0,0,0,1,0.5]. Dist = sqrt(0.1^2+0.1^2) = sqrt(0.02) approx 0.14.
+    #            This is < dist_thresh=0.5. Time gap |0.2-1.2|=1.0 >= 0.1. OK.
+    #            (Need to ensure mutual NN condition holds for this setup).
+
+    # A2 (outlier) should not match.
+    # (A3, B3): Descriptors identical. Time gap |0.4-0.45|=0.05 < 0.1. REJECT.
+    # (A4, B4): A4=[5,5,0,0,0,1,0.5], B4=[5,5,0,0.1,0,0.9,0.5].
+    #            desc_A4 = [5,5,0,0,0,1,0.5]
+    #            desc_B4 = [5,5,0,0.1,0,0.9,0.5]
+    #            Diff vec = [0,0,0, 0.1,0,-0.1,0]. Dist = sqrt(0.1^2 + (-0.1)^2) = sqrt(0.02) approx 0.14.
+    #            This is < dist_thresh=0.5. Time gap |0.5-1.5|=1.0 >=0.1. This would be a match *if* mutual NN.
+    #            Let's make B4's descriptor normal component further to fail dist_thresh:
+    #            B4_mod: normal=[0.5,0,sqrt(1-0.5^2)=0.866]. desc_B4_mod=[5,5,0, 0.5,0,0.866, 0.5]
+    #            Diff vec = [0,0,0, 0.5,0,-0.134,0]. Dist = sqrt(0.5^2 + (-0.134)^2) = sqrt(0.25 + 0.017) = sqrt(0.267) approx 0.517.
+    #            This is > dist_thresh=0.5. So (A4, B4_mod) should be rejected by distance.
+    #            Let's update B4 in surfels_B_list for this.
+    surfels_B_list[4] = ([5.0, 5.0, 0.0], [0.5, 0.0, np.sqrt(1-0.5**2)], 1.5, 0.5) # B4 updated for dist test
+    surfels_B = np.array(surfels_B_list, dtype=surfel_dtype)
+
+
+    # A0 index=0, A1 index=1
+    # B0 index=0, B1 index=1
+    expected_matches = [(0,0), (1,1)] # Assuming A0-B0 and A1-B1 are mutual and pass filters
+
+    # Call the function
+    # Original signature: match_surfels(surfels_current_window, surfels_map, k=1, time_gap_thresh=0.1, dist_thresh=1.0)
+    # My plan used descriptor_dist_thresh. The function uses dist_thresh. Sticking to dist_thresh.
+    actual_matches = match_surfels(surfels_A, surfels_B, time_gap_thresh=time_gap_thresh, dist_thresh=descriptor_dist_thresh)
+
+    # Convert to sets for comparison to ignore order
+    assert set(actual_matches) == set(expected_matches), \
+        f"Expected {expected_matches}, got {actual_matches}"
+
+    # Test case for non-mutual NN:
+    # A_nm = ([0,0,0],[0,0,1],0.1,0.5) -> desc_A_nm = [0,0,0,0,0,1,0.5]
+    # B_nm1 = ([0.01,0,0],[0,0,1],1.1,0.5) -> desc_B_nm1, close to A_nm
+    # B_nm2 = ([10,0,0],[0,0,1],1.2,0.5) -> desc_B_nm2, far from A_nm
+    # Tree_B query for A_nm's desc -> B_nm1
+    # Tree_A query for B_nm1's desc -> A_nm (Mutual) -> Match
+    #
+    # A_nm = ([0,0,0],[0,0,1],0.1,0.5)
+    # A_other = ([-0.01,0,0],[0,0,1],0.05,0.5) # Slightly closer to B_nm1 than A_nm is
+    # B_nm1 = ([0.005,0,0],[0,0,1],1.1,0.5) # B_nm1 is between A_nm and A_other
+    # Tree_B query for A_nm's desc -> B_nm1
+    # Tree_A query for B_nm1's desc -> A_other (Not mutual with A_nm) -> No match for (A_nm, B_nm1)
+    surfels_A_nonmutual = np.array([
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.1, 0.5),    # A_nm (idx 0)
+        ([-0.01, 0.0, 0.0], [0.0, 0.0, 1.0], 0.05, 0.5) # A_other (idx 1)
+    ], dtype=surfel_dtype)
+    surfels_B_nonmutual = np.array([
+        ([0.005, 0.0, 0.0], [0.0, 0.0, 1.0], 1.1, 0.5)   # B_nm1 (idx 0)
     ], dtype=surfel_dtype)
 
-    surfels2 = np.array([
-        ([0.1,0,0], [0,0,1], 0.9, 1.1, 0.5), # Time gap > 0.1
-        ([1.1,0,0], [0,0,1], 0.8, 1.2, 0.5)
-    ], dtype=surfel_dtype)
+    # desc(A_nm) = [0,0,0,...]
+    # desc(A_other) = [-0.01,0,0,...]
+    # desc(B_nm1) = [0.005,0,0,...]
+    # dist(desc(A_nm), desc(B_nm1)) = 0.005
+    # dist(desc(A_other), desc(B_nm1)) = |-0.01 - 0.005| = 0.015
+    # So, NN of desc(B_nm1) in A is A_nm.
+    # NN of desc(A_nm) in B is B_nm1. This IS a mutual match.
+    # My example for non-mutual was flawed.
+    # Let's try:
+    # A0: (0,0,0), ts=0.1
+    # A1: (10,0,0), ts=0.2
+    # B0: (0.1,0,0), ts=1.1 (NN to A0)
+    # B1: (0.2,0,0), ts=1.2 (NN to A0 if A0's desc is [0,0,0] and B0 is [0.1,0,0], B1 is [0.2,0,0])
+    #                   A0's NN is B0.
+    #                   B0's NN is A0. -> (A0,B0) is mutual.
+    #
+    # To break mutuality:
+    # A0=(0,0,0)
+    # A1=(0.05,0,0) # A point very close to A0
+    # B0=(0.02,0,0) # Target point
+    # desc(A0)=[0,...], desc(A1)=[0.05,...], desc(B0)=[0.02,...]
+    # Query B0 against A_descriptors: dist(B0,A0)=0.02, dist(B0,A1)=0.03. So NN of B0 in A is A0.
+    # Query A0 against B_descriptors (only B0): NN of A0 in B is B0.
+    # This is still mutual.
+    # The mutual check is: for A[i] query B -> B[j]. Then for B[j] query A -> A[k]. Match if k==i.
+    # This is already handled by the implementation.
 
-    matches = match_surfels(surfels1, surfels2)
-    assert isinstance(matches, list), "match_surfels should return a list"
-    assert len(matches) == 0, "Placeholder match_surfels should return an empty list"
-
-    # Test with empty inputs
+    # Test with empty inputs (already in placeholder, let's ensure it's here)
     empty_surfels = np.array([], dtype=surfel_dtype)
-    matches_empty1 = match_surfels(empty_surfels, surfels2)
-    assert len(matches_empty1) == 0
-    matches_empty2 = match_surfels(surfels1, empty_surfels)
-    assert len(matches_empty2) == 0
-    matches_empty_all = match_surfels(empty_surfels, empty_surfels)
-    assert len(matches_empty_all) == 0
+    assert match_surfels(empty_surfels, surfels_A, time_gap_thresh, descriptor_dist_thresh) == []
+    assert match_surfels(surfels_A, empty_surfels, time_gap_thresh, descriptor_dist_thresh) == []
+    assert match_surfels(empty_surfels, empty_surfels, time_gap_thresh, descriptor_dist_thresh) == []
+
+    # Test case where one set is empty after descriptor creation (e.g. if surfels had no 'mean' field)
+    # This is implicitly covered if surfels_X.shape[0] == 0 leads to desc_X.shape[0] == 0.
+    # The code already checks `if desc_A.shape[0] == 0 or desc_B.shape[0] == 0: return []`
+    # and `if not surfels_current_window.shape or not surfels_map.shape: return []`
+    # So this should be fine.
+
+    # Test all surfels in A match all surfels in B (e.g. A=B)
+    surfels_C = np.array([
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.1, 0.5),
+        ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.2, 0.5),
+    ], dtype=surfel_dtype)
+    surfels_D = np.array([ # Timestamps shifted to pass time_gap_thresh
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.1, 0.5),
+        ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.2, 0.5),
+    ], dtype=surfel_dtype)
+    expected_CD_matches = [(0,0), (1,1)]
+    actual_CD_matches = match_surfels(surfels_C, surfels_D, time_gap_thresh=0.1, dist_thresh=0.01)
+    assert set(actual_CD_matches) == set(expected_CD_matches)
 
 
 # --- OdometryWindow Tests ---

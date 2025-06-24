@@ -244,7 +244,71 @@ def match_surfels(surfels_current_window, surfels_map, k=1, time_gap_thresh=0.1,
 
     # Actual KDTree and matching logic here...
 
-    return [] # Placeholder
+    if not surfels_current_window.shape or not surfels_map.shape: # Check if arrays are empty
+        return []
+
+    # 1. Construct 7D descriptors for both sets of surfels.
+    #    Descriptor: [mean_x, mean_y, mean_z, normal_x, normal_y, normal_z, resolution]
+    desc_A = np.hstack((
+        surfels_current_window['mean'],
+        surfels_current_window['normal'],
+        surfels_current_window['resolution'][:, np.newaxis]
+    ))
+    desc_B = np.hstack((
+        surfels_map['mean'],
+        surfels_map['normal'],
+        surfels_map['resolution'][:, np.newaxis]
+    ))
+
+    if desc_A.shape[0] == 0 or desc_B.shape[0] == 0:
+        return []
+
+    # 2. Build KD-Trees on descriptors
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        raise ImportError("scipy is required for match_surfels. Please install it.")
+
+    tree_A_desc = KDTree(desc_A)
+    tree_B_desc = KDTree(desc_B)
+
+    # 3. Find nearest neighbors: A -> B and B -> A
+    # For each surfel in A, find its nearest neighbor in B
+    # dist_A_to_B will store distances, idx_A_to_B will store indices into desc_B
+    dist_A_to_B, idx_A_to_B = tree_B_desc.query(desc_A, k=1)
+
+    # For each surfel in B, find its nearest neighbor in A
+    dist_B_to_A, idx_B_to_A = tree_A_desc.query(desc_B, k=1)
+
+    matches = []
+
+    # 4. Mutual Nearest Neighbor Check and Filtering
+    for i in range(desc_A.shape[0]):
+        # Surfel surfels_current_window[i] has surfels_map[idx_A_to_B[i]] as its NN in B
+        idx_j_in_B = idx_A_to_B[i] # This is the index in surfels_map (and desc_B)
+
+        # Mutual check: Is surfels_current_window[i] the NN of surfels_map[idx_j_in_B]?
+        # idx_B_to_A[idx_j_in_B] gives the index in surfels_current_window (and desc_A)
+        # that is the NN of surfels_map[idx_j_in_B].
+        if idx_B_to_A[idx_j_in_B] == i:
+            # It's a mutual nearest neighbor. Now apply other filters.
+
+            # Filter by descriptor distance
+            current_descriptor_dist = dist_A_to_B[i] # Distance between desc_A[i] and desc_B[idx_j_in_B]
+            if current_descriptor_dist > dist_thresh: # Using dist_thresh from function args
+                continue
+
+            # Filter by time gap
+            ts_A = surfels_current_window[i]['timestamp_mean']
+            ts_B = surfels_map[idx_j_in_B]['timestamp_mean']
+            if abs(ts_A - ts_B) < time_gap_thresh: # Plan: "timestamp_mean values are closer than time_gap_thresh"
+                                                   # Plan states: "surfels are only matched if their mean timestamps are separated by at least time_gap_thresh"
+                                                   # So, if abs(ts_A - ts_B) < time_gap_thresh, REJECT. This is correct.
+                continue
+
+            matches.append((i, idx_j_in_B))
+
+    return matches
 
 
 class OdometryWindow:
