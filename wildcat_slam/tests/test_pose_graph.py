@@ -681,6 +681,195 @@ def test_icp_y_translation_simplified_geometry(surfel_array_fixture):
     assert rotation_error_rad < rotation_tol, f"ICP (Y-translation, simplified geom) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
 
 
+def _generate_random_planar_surfels(num_points_per_plane, plane_normals, plane_ds, surfel_dtype, bbox_min=-1, bbox_max=1):
+    """Helper to generate surfels on a few planes."""
+    all_surfels_list = []
+    rng = np.random.default_rng(seed=42) # Seed for reproducibility
+
+    for plane_idx, normal_vec in enumerate(plane_normals):
+        normal_vec = normal_vec / np.linalg.norm(normal_vec)
+        # Create a basis for the plane
+        if np.abs(normal_vec[2]) < 0.9: # If normal is not mostly Z
+            u_axis = np.cross(normal_vec, [0,0,1])
+        else: # Normal is mostly Z, use X as auxiliary
+            u_axis = np.cross(normal_vec, [1,0,0])
+        u_axis /= np.linalg.norm(u_axis)
+        v_axis = np.cross(normal_vec, u_axis)
+        v_axis /= np.linalg.norm(v_axis)
+
+        for _ in range(num_points_per_plane):
+            # Generate random point in plane coordinates
+            # For simplicity, using a square region in the plane's coordinate system
+            # The actual bbox for points will be more complex due to plane orientation
+            u_coord = rng.uniform(bbox_min, bbox_max)
+            v_coord = rng.uniform(bbox_min, bbox_max)
+
+            # Point on plane: d*normal + u*u_axis + v*v_axis
+            # If d is distance from origin along normal: p.normal = d. So point = d*normal + p_in_plane_component
+            # where p_in_plane_component is orthogonal to normal.
+            # Point p = d * normal + u_coord * u_axis + v_coord * v_axis
+            # This ensures p_on_plane dot normal = d * (normal dot normal) = d
+            mean_vec = plane_ds[plane_idx] * normal_vec + u_coord * u_axis + v_coord * v_axis
+
+            # Ensure points roughly stay within the conceptual bbox (optional, points are on infinite planes)
+            # This is tricky; for now, accept points as generated on the planes.
+
+            all_surfels_list.append(
+                (mean_vec, normal_vec, 0.9, 1.0, 0.1) # score, timestamp_mean, resolution are dummy
+            )
+
+    if not all_surfels_list: # Should not happen if num_points_per_plane > 0 and planes are given
+        # Create a default surfel if list is empty to avoid errors with np.array
+         all_surfels_list.append( ([0,0,0], [0,0,1], 0.9,1.0,0.1))
+
+    return np.array(all_surfels_list, dtype=surfel_dtype)
+
+
+def test_icp_random_geometry_combined_transform(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    # Define a few planes
+    plane_normals = [
+        np.array([1.0, 0.0, 0.0]), # X-normal plane
+        np.array([0.0, 1.0, 0.0]), # Y-normal plane
+        np.array([0.0, 0.0, 1.0]), # Z-normal plane
+        np.array([1.0, 1.0, 1.0]) / np.linalg.norm([1,1,1]), # Oblique plane
+    ]
+    plane_ds = [0.5, -0.5, 0.5, 0.0] # Distances from origin for each plane
+
+    target_surfels = _generate_random_planar_surfels(15, plane_normals, plane_ds, surfel_dtype, bbox_min=-1.5, bbox_max=1.5)
+    # Ensure we have enough points (at least 6)
+    if len(target_surfels) < 6:
+        pytest.skip("Not enough surfels generated for random geometry test, skipping.")
+
+
+    # Define a true transform (e.g., similar to the original failing test)
+    true_trans = np.array([0.3, -0.2, 0.15])
+    true_rot_axis = np.array([0.1, -0.2, 0.3]) # Some arbitrary rotation axis
+    true_rot_angle = np.deg2rad(20)
+    true_omega = (true_rot_axis / np.linalg.norm(true_rot_axis)) * true_rot_angle
+    true_transform_T_target_source = se3_exp(se3_hat(np.hstack((true_trans, true_omega))))
+
+    inv_true_transform = np.linalg.inv(true_transform_T_target_source)
+    inv_R_true = inv_true_transform[:3,:3]
+    source_surfels_list = []
+    for t_surf in target_surfels:
+        t_mean_homo = np.append(t_surf['mean'], 1)
+        s_mean_homo = inv_true_transform @ t_mean_homo
+        s_mean = s_mean_homo[:3]
+        s_normal = inv_R_true @ t_surf['normal'] # Transform normals by rotation
+        s_normal = s_normal / (np.linalg.norm(s_normal) + 1e-9)
+        source_surfels_list.append(
+            (s_mean, s_normal, t_surf['score'], t_surf['timestamp_mean'], t_surf['resolution'])
+        )
+    source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
+
+    initial_pose_estimate = np.eye(4)
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=100, tolerance=1e-4, max_correspondence_dist=1.5 # Slightly looser tolerance, larger max_dist
+    )
+
+    assert success, "ICP (random geom) did not converge successfully"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error = np.linalg.norm(error_twist[:3])
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    # Tolerances might need to be a bit looser for random geometry
+    translation_tol = 5e-2 # 5 cm
+    rotation_tol = np.deg2rad(2.0) # 2 degrees
+
+    assert translation_error < translation_tol, f"ICP (random geom) translation error too high: {translation_error} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (random geom) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
+def test_icp_oblique_plane_transform(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    # 1. Define points on a canonical plane (e.g., XY plane, z=0, normal [0,0,1])
+    canonical_points_mean = [
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], # A square
+        [0.5, 0.5, 0.0], [0.25, 0.75, 0.0] # Some additional points
+    ]
+    canonical_normal = np.array([0.0, 0.0, 1.0])
+
+    # 2. Define the desired oblique normal and create rotation to achieve it
+    oblique_normal_target = np.array([1.0, 1.0, 1.0])
+    oblique_normal_target = oblique_normal_target / np.linalg.norm(oblique_normal_target)
+
+    # Rotation R_oblique such that R_oblique @ canonical_normal = oblique_normal_target
+    # This can be found using Rodrigues' rotation formula or by finding quaternion
+    v_axis = np.cross(canonical_normal, oblique_normal_target)
+    angle_cos = np.dot(canonical_normal, oblique_normal_target)
+
+    if np.isclose(angle_cos, 1.0): # Already aligned
+        R_oblique = np.eye(3)
+    elif np.isclose(angle_cos, -1.0): # Opposite, rotate 180 deg around any axis perp to canonical_normal
+        # e.g. rotate around X axis if canonical_normal is Z axis
+        R_oblique = so3_exp(so3_hat(np.array([np.pi, 0, 0]))) if np.allclose(canonical_normal, [0,0,1]) else so3_exp(so3_hat(np.array([0, np.pi, 0]))) # Fallback, needs better general solution
+    else:
+        angle_sin = np.linalg.norm(v_axis)
+        v_axis_normalized = v_axis / angle_sin
+        omega_hat_oblique = so3_hat(v_axis_normalized * np.arccos(angle_cos))
+        R_oblique = so3_exp(omega_hat_oblique)
+
+    # 3. Transform canonical points and normal to get target surfels
+    target_surfels_list = []
+    for p_mean in canonical_points_mean:
+        rotated_mean = R_oblique @ np.array(p_mean)
+        # For this test, all points will share the same oblique normal
+        target_surfels_list.append(
+            (rotated_mean, oblique_normal_target, 0.9, 1.0, 0.1)
+        )
+    target_surfels = np.array(target_surfels_list, dtype=surfel_dtype)
+
+    # 4. Define a true transform (combined rotation and translation)
+    true_trans = np.array([-0.1, 0.25, -0.05])
+    true_rot_axis = np.array([-0.3, 0.1, 0.2]) # Some arbitrary rotation axis
+    true_rot_angle = np.deg2rad(15)
+    true_omega = (true_rot_axis / np.linalg.norm(true_rot_axis)) * true_rot_angle
+    true_transform_T_target_source = se3_exp(se3_hat(np.hstack((true_trans, true_omega))))
+
+    # 5. Generate source surfels
+    inv_true_transform = np.linalg.inv(true_transform_T_target_source)
+    inv_R_true = inv_true_transform[:3,:3]
+    source_surfels_list = []
+    for t_surf in target_surfels:
+        t_mean_homo = np.append(t_surf['mean'], 1)
+        s_mean_homo = inv_true_transform @ t_mean_homo
+        s_mean = s_mean_homo[:3]
+        s_normal = inv_R_true @ t_surf['normal'] # Transform normals by rotation
+        s_normal = s_normal / (np.linalg.norm(s_normal) + 1e-9)
+        source_surfels_list.append(
+            (s_mean, s_normal, t_surf['score'], t_surf['timestamp_mean'], t_surf['resolution'])
+        )
+    source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
+
+    # 6. Call ICP
+    initial_pose_estimate = np.eye(4)
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=100, tolerance=1e-4, max_correspondence_dist=1.0
+    )
+
+    assert success, "ICP (oblique plane) did not converge successfully"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error = np.linalg.norm(error_twist[:3])
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    translation_tol = 5e-2 # 5 cm (similar to random geometry)
+    rotation_tol = np.deg2rad(2.0) # 2 degrees
+
+    assert translation_error < translation_tol, f"ICP (oblique plane) translation error too high: {translation_error} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (oblique plane) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
 def test_icp_robustness_to_noise(surfel_array_fixture):
     builder = GraphBuilder()
     surfel_dtype = surfel_array_fixture.dtype
