@@ -372,6 +372,144 @@ def test_icp_recovers_known_transform(surfel_array_fixture): # Use surfel_array_
     assert np.all(eigenvalues_cov >= -1e-9), "Covariance matrix is not positive semi-definite"
 
 
+def test_icp_rotation_only(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    target_surfels_list = [
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1),
+        ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1), ([0.0, 1.0, 1.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1),
+    ]
+    target_surfels = np.array(target_surfels_list, dtype=surfel_dtype)
+
+    true_dx = np.array([0.0, 0.0, 0.0]) # Pure rotation
+    true_rot_axis = np.array([0, 0, 1.0])
+    true_rot_angle = np.deg2rad(30)
+    true_omega = true_rot_axis * true_rot_angle
+    true_transform_T_target_source = se3_exp(se3_hat(np.hstack((true_dx, true_omega))))
+
+    inv_true_transform = np.linalg.inv(true_transform_T_target_source)
+    inv_R_true = inv_true_transform[:3,:3]
+    source_surfels_list = []
+    for t_surf in target_surfels:
+        t_mean_homo = np.append(t_surf['mean'], 1)
+        s_mean_homo = inv_true_transform @ t_mean_homo
+        s_mean = s_mean_homo[:3]
+        s_normal = inv_R_true @ t_surf['normal']
+        s_normal = s_normal / (np.linalg.norm(s_normal) + 1e-9)
+        source_surfels_list.append(
+            (s_mean, s_normal, t_surf['score'], t_surf['timestamp_mean'], t_surf['resolution'])
+        )
+    source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
+
+    initial_pose_estimate = np.eye(4)
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=100, tolerance=1e-5, max_correspondence_dist=1.0
+    )
+
+    assert success, "ICP (rotation-only) did not converge successfully"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error = np.linalg.norm(error_twist[:3])
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    translation_tol = 1e-3
+    rotation_tol = np.deg2rad(0.1)
+
+    assert translation_error < translation_tol, f"ICP (rotation-only) translation error too high: {translation_error} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (rotation-only) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
+def test_icp_translation_only(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    target_surfels_list = [
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1),
+        ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1), ([0.0, 1.0, 1.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1),
+    ]
+    target_surfels = np.array(target_surfels_list, dtype=surfel_dtype)
+
+    true_dx = np.array([0.2, -0.1, 0.3]) # Pure translation
+    true_omega = np.array([0.0, 0.0, 0.0])
+    true_transform_T_target_source = se3_exp(se3_hat(np.hstack((true_dx, true_omega))))
+
+    inv_true_transform = np.linalg.inv(true_transform_T_target_source)
+    inv_R_true = inv_true_transform[:3,:3] # Should be identity
+    source_surfels_list = []
+    for t_surf in target_surfels:
+        t_mean_homo = np.append(t_surf['mean'], 1)
+        s_mean_homo = inv_true_transform @ t_mean_homo
+        s_mean = s_mean_homo[:3]
+        # For pure translation, source normals are same as target normals
+        s_normal = t_surf['normal'] # More direct: inv_R_true @ t_surf['normal']
+        source_surfels_list.append(
+            (s_mean, s_normal, t_surf['score'], t_surf['timestamp_mean'], t_surf['resolution'])
+        )
+    source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
+
+    initial_pose_estimate = np.eye(4)
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=100, tolerance=1e-5, max_correspondence_dist=1.0
+    )
+
+    assert success, "ICP (translation-only) did not converge successfully"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error = np.linalg.norm(error_twist[:3])
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    translation_tol = 1e-3
+    rotation_tol = np.deg2rad(0.1)
+
+    assert translation_error < translation_tol, f"ICP (translation-only) translation error too high: {translation_error} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (translation-only) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
+def test_icp_identity_transform(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    target_surfels_list = [
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.9, 1.0, 0.1),
+        ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1), ([1.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1), ([0.0, 1.0, 1.0], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1),
+    ]
+    target_surfels = np.array(target_surfels_list, dtype=surfel_dtype)
+
+    # Source surfels are identical to target surfels
+    source_surfels = np.copy(target_surfels)
+    true_transform_T_target_source = np.eye(4) # Identity transform
+
+    initial_pose_estimate = np.eye(4)
+    # For identity, ICP should converge very quickly, possibly in 0 iterations if checked first.
+    # Let's give it a few iterations to ensure it doesn't diverge.
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=10, tolerance=1e-7, max_correspondence_dist=0.1 # Tighter tolerance for identity
+    )
+
+    assert success, "ICP (identity) did not report convergence (success=True)"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error = np.linalg.norm(error_twist[:3])
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    # Expect very small errors for identity
+    translation_tol = 1e-6
+    rotation_tol = np.deg2rad(1e-4) # Very small rotation tolerance
+
+    assert translation_error < translation_tol, f"ICP (identity) translation error too high: {translation_error} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (identity) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
 def test_icp_robustness_to_noise(surfel_array_fixture):
     builder = GraphBuilder()
     surfel_dtype = surfel_array_fixture.dtype
