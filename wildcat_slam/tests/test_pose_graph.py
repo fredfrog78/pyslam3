@@ -620,6 +620,67 @@ def test_icp_single_axis_translation(surfel_array_fixture, axis_name, translatio
     assert rotation_error_rad < rotation_tol, f"ICP (translation {axis_name}-axis) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
 
 
+def test_icp_y_translation_simplified_geometry(surfel_array_fixture):
+    builder = GraphBuilder()
+    surfel_dtype = surfel_array_fixture.dtype
+
+    # Simplified geometry: 4 points on the XZ plane (y=0), all with normal pointing purely along +Y.
+    # This should strongly constrain Y translation.
+    # The points are spread out to provide some rotational constraint, though Y is primary.
+    target_surfels_list = [
+        ([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        ([1.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.9, 1.0, 0.1),
+        # Adding two more points with X normals to ensure 6DoF is theoretically constrained
+        # even if some DoF are weak. These normals are orthogonal to the Y-translation.
+        ([0.0, 0.5, 0.5], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1),
+        ([0.0, -0.5, 0.5], [1.0, 0.0, 0.0], 0.9, 1.0, 0.1),
+    ]
+    target_surfels = np.array(target_surfels_list, dtype=surfel_dtype)
+
+    true_dx = np.array([0.0, 0.2, 0.0]) # Pure Y-axis translation
+    true_omega = np.array([0.0, 0.0, 0.0])
+    true_transform_T_target_source = se3_exp(se3_hat(np.hstack((true_dx, true_omega))))
+
+    inv_true_transform = np.linalg.inv(true_transform_T_target_source)
+    source_surfels_list = []
+    for t_surf in target_surfels:
+        t_mean_homo = np.append(t_surf['mean'], 1)
+        s_mean_homo = inv_true_transform @ t_mean_homo
+        s_mean = s_mean_homo[:3]
+        # For pure translation, source normals are same as target normals
+        s_normal = t_surf['normal']
+        source_surfels_list.append(
+            (s_mean, s_normal, t_surf['score'], t_surf['timestamp_mean'], t_surf['resolution'])
+        )
+    source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
+
+    initial_pose_estimate = np.eye(4)
+    estimated_pose, _, success = builder.icp_point2plane(
+        source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
+        max_iterations=100, tolerance=1e-5, max_correspondence_dist=1.0
+    )
+
+    assert success, "ICP (Y-translation, simplified geom) did not converge successfully"
+
+    error_transform = np.linalg.inv(estimated_pose) @ true_transform_T_target_source
+    error_twist = se3_vee(se3_log(error_transform))
+    translation_error_vec = error_twist[:3]
+    translation_error_norm = np.linalg.norm(translation_error_vec)
+    rotation_error_rad = np.linalg.norm(error_twist[3:])
+
+    translation_tol = 1e-3
+    rotation_tol = np.deg2rad(0.1)
+
+    # Check Y-component of translation error specifically, plus overall norm
+    y_translation_error = np.abs(translation_error_vec[1])
+
+    assert y_translation_error < translation_tol, f"ICP (Y-translation, simplified geom) Y-component error too high: {y_translation_error} m"
+    assert translation_error_norm < translation_tol, f"ICP (Y-translation, simplified geom) total translation error too high: {translation_error_norm} m"
+    assert rotation_error_rad < rotation_tol, f"ICP (Y-translation, simplified geom) rotation error too high: {np.rad2deg(rotation_error_rad)} degrees"
+
+
 def test_icp_robustness_to_noise(surfel_array_fixture):
     builder = GraphBuilder()
     surfel_dtype = surfel_array_fixture.dtype
