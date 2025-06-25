@@ -228,6 +228,7 @@ class GraphBuilder:
             return []
 
         from scipy.spatial import KDTree # Import here as it's a specific dependency
+        from .geometry import so3_hat # Ensure so3_hat is available
 
         # Build KD-tree from positions of other nodes
         kdtree = KDTree(np.array(candidate_nodes_positions))
@@ -261,23 +262,11 @@ class GraphBuilder:
             tuple: (optimized_relative_pose_se3 (4x4), covariance_matrix (6x6), success_flag (bool))
                    optimized_relative_pose_se3 is T_tgt_src.
         """
-        # This is a complex function. Placeholder for now.
-        # Steps would involve:
-        # 1. Initialize current_T_tgt_src with initial_relative_guess_se3 or Identity.
-        # 2. Loop for max_iterations:
-        #    a. Transform src_surfels_means using current_T_tgt_src.
-        #    b. For each transformed src_surfel_mean, find closest point in tgt_surfels_means (or its normal projection).
-        #       This requires a KDTree on tgt_surfels['mean'].
-        #    c. Form point-to-plane error residuals: dot( (T_src_mean - tgt_mean), tgt_normal ).
-        #    d. Compute Jacobian of these residuals w.r.t. small perturbation of current_T_tgt_src (a 6-vector xi).
-        #    e. Solve linear system (J^T J) * xi = -J^T * residuals.
-        #    f. Update current_T_tgt_src using se3_exp(se3_hat(xi)) @ current_T_tgt_src.
         from scipy.spatial import KDTree
-        from .geometry import se3_exp, se3_hat, so3_hat # se3_log for checking convergence if needed
+        from .geometry import se3_exp, se3_hat, so3_hat
 
         if src_surfels.shape[0] == 0 or tgt_surfels.shape[0] == 0:
-            # print("Warning: ICP called with empty source or target surfels.")
-            return initial_relative_guess_se3 if initial_relative_guess_se3 is not None else np.eye(4), np.eye(6) * 1e6, False # High covariance, not successful
+            return initial_relative_guess_se3 if initial_relative_guess_se3 is not None else np.eye(4), np.eye(6) * 1e6, False
 
         current_pose_estimate = np.eye(4) if initial_relative_guess_se3 is None else np.copy(initial_relative_guess_se3)
 
@@ -288,14 +277,11 @@ class GraphBuilder:
 
         try:
             target_means_tree = KDTree(target_means)
-        except Exception as e: # Catch potential KDTree errors with empty/degenerate data
-            # print(f"Error creating KDTree for target surfels: {e}")
+        except Exception as e:
             return current_pose_estimate, np.eye(6) * 1e6, False
 
-
-        lambda_damping = 1e-4 # Moderate damping factor
+        lambda_damping = 1e-4 # REVERTED to original
         max_corr_dist_sq = max_correspondence_dist * max_correspondence_dist
-
         iterations_performed = 0
         success = False
 
@@ -305,117 +291,71 @@ class GraphBuilder:
             r_rows = []
             valid_correspondences = 0
 
-            src_means_homo = np.hstack((src_surfels['mean'], np.ones((src_surfels.shape[0], 1)))) # (N, 4)
-
+            src_means_homo = np.hstack((src_surfels['mean'], np.ones((src_surfels.shape[0], 1))))
             p_src_transformed_homo = src_means_homo @ current_pose_estimate.T
             p_src_transformed = p_src_transformed_homo[:, :3]
-
 
             distances, indices = target_means_tree.query(p_src_transformed, k=1)
 
             for k_src in range(src_surfels.shape[0]):
                 p_s_trans = p_src_transformed[k_src]
-
                 idx_t = indices[k_src]
                 dist_sq = distances[k_src]**2
 
-                if dist_sq > max_corr_dist_sq: # Use the squared distance
+                if dist_sq > max_corr_dist_sq:
                     continue
 
                 p_t = target_means[idx_t]
                 n_t = target_normals[idx_t]
-
-                # Point-to-plane error residual: error = dot(transformed_src_mean - target_mean, target_normal)
                 error = np.dot(p_s_trans - p_t, n_t)
 
-                # Jacobian J_k (1x6) for point p_s_trans and target normal n_t
-                # J_k = [n_t^T, (skew(p_s_trans) @ n_t)^T]
-                # skew(p_s_trans) is so3_hat(p_s_trans)
-                # The translational part of Jacobian is n_t
-                # The rotational part of Jacobian is so3_hat(p_s_trans) @ n_t (or -so3_hat(p_s_trans)@n_t depending on convention)
-                # Let's use the formulation that matches common literature for left perturbation:
-                # d(T*p)/d_xi = [I, -[T*p]_x] where T*p is p_s_trans.
-                # So error = n_t^T * ( (exp(delta_xi) T) p_s - p_t )
-                # Jacobian of error w.r.t delta_xi = [n_t^T , n_t^T * (-so3_hat(p_s_trans))] = [n_t^T, (-so3_hat(p_s_trans).T @ n_t)^T ]
-                # = [n_t^T, (so3_hat(p_s_trans) @ n_t)^T] because so3_hat is skew symmetric.
-
                 J_k_translation = n_t
-                J_k_rotation = np.cross(p_s_trans, n_t) # This is equivalent to (so3_hat(p_s_trans) @ n_t) if so3_hat(a)b = a x b
-                                                        # Or ( - so3_hat(p_s_trans) @ n_t ) based on other forms.
-                                                        # Let's use a x n for rotational part's effect on point `a`'s position due to rotation around origin.
-                                                        # The point p_s_trans moves by omega x p_s_trans. Jacobian component is n_t . (omega x p_s_trans)
-                                                        # = (p_s_trans x n_t) . omega. So J_rot = p_s_trans x n_t
-
-                # Let's re-verify Jacobian for point-to-plane:
-                # e = n_tgt^T * (exp(dxi^) * T_cur * p_src - p_tgt)
-                # de/dxi = n_tgt^T * d(exp(dxi^) * T_cur * p_src)/dxi
-                # d(exp(dxi^) * P)/dxi at dxi=0 is [I, -[P]_x] where P = T_cur * p_src = p_s_trans
-                # So, J_k = n_t^T * [I, -so3_hat(p_s_trans)] = [n_t^T, -n_t^T @ so3_hat(p_s_trans)]
-                # -n_t^T @ so3_hat(p_s_trans) = (so3_hat(p_s_trans) @ n_t)^T
-                # J_k_rotation = so3_hat(p_s_trans) @ n_t
-
-                J_k_rot_part = so3_hat(p_s_trans) @ n_t # (3,) vector
-                J_k = np.hstack((n_t, J_k_rot_part))   # (6,) vector
+                J_k_rot_part = so3_hat(p_s_trans) @ n_t # (3,) vector - Original SIGN
+                J_k = np.hstack((n_t, J_k_rot_part))
 
                 J_rows.append(J_k)
                 r_rows.append(error)
                 valid_correspondences += 1
 
-            if valid_correspondences < 6: # Need at least 6 good correspondences for 6DoF
-                # print(f"ICP Warning: Not enough valid correspondences ({valid_correspondences}) in iteration {i+1}.")
-                if i == 0: success = False # Failed on first iteration
-                break # Stop if not enough correspondences
+            if valid_correspondences < 6:
+                if i == 0: success = False
+                break
 
-            J = np.array(J_rows)    # (M, 6)
-            r = np.array(r_rows)    # (M,)
-
-            # Solve (J^T J + lambda*I) dx = -J^T r
+            J = np.array(J_rows)
+            r = np.array(r_rows)
             H = J.T @ J + lambda_damping * np.eye(6)
             g = -J.T @ r
 
             try:
-                dx = np.linalg.solve(H, g) # (6,) twist vector [vx,vy,vz, wx,wy,wz]
+                dx = np.linalg.solve(H, g)
             except np.linalg.LinAlgError:
-                # print(f"ICP Warning: Singular matrix in iteration {i+1}. Failed to solve for dx.")
                 if i == 0: success = False
                 break
 
-            # print(f"Iter {i+1}: valid_corr={valid_correspondences}, norm(r)={np.linalg.norm(r) if valid_correspondences > 0 else -1:.4e}, norm(dx)={np.linalg.norm(dx):.4e}")
+            # This print statement was added for debugging
+            print(f"Iter {i+1}: valid_corr={valid_correspondences}, norm(r)={np.linalg.norm(r) if valid_correspondences > 0 and r.size > 0 else -1:.4e}, norm(dx)={np.linalg.norm(dx):.4e}, mean_abs_res={np.mean(np.abs(r)) if valid_correspondences > 0 and r.size > 0 else -1:.4e}")
 
-            # Update pose: T_new = exp(dx_hat) * T_old
             delta_transform = se3_exp(se3_hat(dx))
             current_pose_estimate = delta_transform @ current_pose_estimate
 
-            # Normalize rotation part of current_pose_estimate to ensure it stays SO(3)
             R_updated = current_pose_estimate[:3,:3]
             U, _, Vt = np.linalg.svd(R_updated)
             R_corrected = U @ Vt
-            # Ensure determinant is +1
             if np.linalg.det(R_corrected) < 0:
-                # Vt_copy = np.copy(Vt) # Don't modify Vt in place if it's used elsewhere, though here it's fine.
-                # Vt_copy[-1,:] *= -1
-                # R_corrected = U @ Vt_copy
-                # A more direct way if U, Vt are from SVD of a near-rotation matrix:
                 R_corrected = U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt
             current_pose_estimate[:3,:3] = R_corrected
-
 
             if np.linalg.norm(dx) < tolerance:
                 success = True
                 break
 
-        # Estimate covariance: (J^T J)^-1 (if J from last iteration is available and well-conditioned)
-        # This is an approximation. More robust covariance estimation might involve all points or M-estimators.
-        covariance_matrix = np.eye(6) * 1e6 # Default high covariance
+        covariance_matrix = np.eye(6) * 1e6
         if success and valid_correspondences >=6 :
             try:
-                # Using J from the last successful iteration (before dx became small)
-                # If loop broke due to tolerance, J and r are from that iteration.
-                H_final = J.T @ J # No damping for covariance estimate
+                H_final = J.T @ J
                 covariance_matrix = np.linalg.inv(H_final)
             except np.linalg.LinAlgError:
-                # print("ICP Warning: Singular matrix when estimating covariance.")
-                pass # Keep default high covariance
+                pass
 
         return current_pose_estimate, covariance_matrix, success
 

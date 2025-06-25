@@ -850,10 +850,14 @@ def test_icp_oblique_plane_transform(surfel_array_fixture):
     source_surfels = np.array(source_surfels_list, dtype=surfel_dtype)
 
     # 6. Call ICP
-    initial_pose_estimate = np.eye(4)
+    # initial_pose_estimate = np.eye(4) # Original
+    small_perturb_twist = np.array([0.01, -0.01, 0.005, 0.005, -0.002, 0.003]) # Small perturbation
+    initial_pose_estimate = se3_exp(se3_hat(small_perturb_twist))
+
+
     estimated_pose, _, success = builder.icp_point2plane(
         source_surfels, target_surfels, initial_relative_guess_se3=initial_pose_estimate,
-        max_iterations=100, tolerance=1e-4, max_correspondence_dist=1.0
+        max_iterations=100, tolerance=1e-10, max_correspondence_dist=1.0 # Greatly reduced tolerance
     )
 
     assert success, "ICP (oblique plane) did not converge successfully"
