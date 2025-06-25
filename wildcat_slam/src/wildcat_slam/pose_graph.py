@@ -380,6 +380,8 @@ class GraphBuilder:
                 if i == 0: success = False
                 break
 
+            # print(f"Iter {i+1}: valid_corr={valid_correspondences}, norm(r)={np.linalg.norm(r) if valid_correspondences > 0 else -1:.4e}, norm(dx)={np.linalg.norm(dx):.4e}")
+
             # Update pose: T_new = exp(dx_hat) * T_old
             delta_transform = se3_exp(se3_hat(dx))
             current_pose_estimate = delta_transform @ current_pose_estimate
